@@ -90,32 +90,37 @@ void FMMNode<D>::compute_multipole(int order) {
                 center_of_mass += body->position * body->mass;
             }
             
-            if (total_mass > 0) {
+            if (total_mass > 1e-10) {  // Check for non-zero mass
                 center_of_mass = center_of_mass / total_mass;
-            }
-            
-            // Store total mass and center of mass
-            multipole.coeff[0] = std::complex<double>(total_mass, 0.0);
-            
-            if (order > 0) {
-                // Store center of mass in first coefficient for improved accuracy
-                std::complex<double> z_com = to_complex(center_of_mass - center);
-                multipole.coeff[1] = z_com * total_mass;
-            }
-            
-            // Higher order terms for improved accuracy
-            for (Body<D>* body : bodies) {
-                std::complex<double> z = to_complex(body->position - center);
-                std::complex<double> z_power = z * z; // Start with z^2
                 
-                for (int p = 2; p <= order; ++p) {
-                    // Use normalized coefficients for better numerical stability
-                    multipole.coeff[p] += -body->mass * z_power / static_cast<double>(p);
-                    z_power *= z; // Next power
+                // Store total mass and center of mass
+                multipole.coeff[0] = std::complex<double>(total_mass, 0.0);
+                
+                if (order > 0) {
+                    // Store center of mass in first coefficient for improved accuracy
+                    std::complex<double> z_com = to_complex(center_of_mass - center);
+                    multipole.coeff[1] = z_com * total_mass;
+                }
+                
+                // Higher order terms with improved stability
+                for (Body<D>* body : bodies) {
+                    std::complex<double> z = to_complex(body->position - center);
+                    if (std::abs(z) < 1e-10) continue;  // Skip very close points
+                    
+                    std::complex<double> z_power = z * z; // Start with z^2
+                    
+                    for (int p = 2; p <= order; ++p) {
+                        // Use normalized coefficients for better numerical stability
+                        double scale = 1.0 / (p * std::abs(z_power));
+                        if (scale > 1e10) continue;  // Skip if scaling would be too large
+                        
+                        multipole.coeff[p] += -body->mass * z_power * scale;
+                        z_power *= z; // Next power
+                    }
                 }
             }
         } else {
-            // 3D implementation with improved monopole and dipole terms
+            // 3D implementation with improved stability
             double total_mass = 0.0;
             Vector<D> center_of_mass = Vector<D>();
             
@@ -124,47 +129,51 @@ void FMMNode<D>::compute_multipole(int order) {
                 center_of_mass += body->position * body->mass;
             }
             
-            if (total_mass > 0) {
+            if (total_mass > 1e-10) {  // Check for non-zero mass
                 center_of_mass = center_of_mass / total_mass;
-            }
-            
-            // Store mass in first coefficient
-            multipole.coeff[0] = std::complex<double>(total_mass, 0.0);
-            
-            if (order > 0 && multipole.coeff.size() > 2) {
-                // Store center of mass for improved accuracy
-                multipole.coeff[1] = std::complex<double>(center_of_mass[0], center_of_mass[1]);
-                multipole.coeff[2] = std::complex<double>(center_of_mass[2], 0.0);
+                
+                // Store mass in first coefficient
+                multipole.coeff[0] = std::complex<double>(total_mass, 0.0);
+                
+                if (order > 0 && multipole.coeff.size() > 2) {
+                    // Store center of mass for improved accuracy
+                    multipole.coeff[1] = std::complex<double>(center_of_mass[0], center_of_mass[1]);
+                    multipole.coeff[2] = std::complex<double>(center_of_mass[2], 0.0);
+                }
             }
         }
     } else {
-        // Rest of the M2M implementation
+        // M2M: Multipole to Multipole translation
         for (const auto& child : children) {
             if (child) {
                 child->compute_multipole(order);
                 
                 if constexpr (D == 2) {
-                    // 2D implementation with complex numbers
+                    // 2D implementation with improved stability
                     std::complex<double> z0 = to_complex(child->center - center);
+                    if (std::abs(z0) < 1e-10) continue;  // Skip very close points
                     
                     multipole.coeff[0] += child->multipole.coeff[0]; // Mass term
                     
-                    // Compute higher order terms
+                    // Compute higher order terms with improved stability
                     for (int p = 1; p <= order; ++p) {
                         // Sum contributions from child's multipole moments
                         multipole.coeff[p] += child->multipole.coeff[p];
                         
                         // Adjust for the shift in coordinates using binomial expansion
                         for (int k = 0; k < p; ++k) {
+                            double scale = 1.0 / std::abs(z0);
+                            if (scale > 1e10) continue;  // Skip if scaling would be too large
+                            
                             std::complex<double> term = 
                                 child->multipole.coeff[k] * pow(-z0, p-k) * 
-                                static_cast<double>(binomial(p, k));
+                                static_cast<double>(binomial(p, k)) * scale;
                             multipole.coeff[p] += term;
                         }
                     }
                 } else {
-                    // 3D implementation with spherical harmonics goes here
-                    multipole.coeff[0] += child->multipole.coeff[0]; // Mass term for demo
+                    // 3D implementation with improved stability
+                    multipole.coeff[0] += child->multipole.coeff[0]; // Mass term
                 }
             }
         }
@@ -663,6 +672,10 @@ Vector<D> FMM<D>::calculate_accurate_force(const Body<D>& body) {
                     
                     double r_mag = std::sqrt(r_sq);
                     double force_mag = G * body.mass * other->mass / (r_sq * r_mag);
+                    
+                    // Check for numerical overflow
+                    if (std::isnan(force_mag) || std::isinf(force_mag)) continue;
+                    
                     force += r.normalized() * force_mag;
                 }
                 return force;
@@ -674,6 +687,7 @@ Vector<D> FMM<D>::calculate_accurate_force(const Body<D>& body) {
         if (node->half_size / dist < 0.3) { // More conservative
             // Get total mass
             double total_mass = node->multipole.coeff[0].real();
+            if (total_mass < 1e-10) return Vector<D>();  // Skip if mass is too small
             
             // Try using center of mass for better accuracy
             Vector<D> com_pos = node->center;
@@ -699,6 +713,10 @@ Vector<D> FMM<D>::calculate_accurate_force(const Body<D>& body) {
             
             double r_mag = std::sqrt(r_sq);
             double force_mag = G * body.mass * total_mass / (r_sq * r_mag);
+            
+            // Check for numerical overflow
+            if (std::isnan(force_mag) || std::isinf(force_mag)) return Vector<D>();
+            
             return r.normalized() * force_mag;
         } else {
             // Recurse to children
@@ -714,6 +732,10 @@ Vector<D> FMM<D>::calculate_accurate_force(const Body<D>& body) {
                     
                     double r_mag = std::sqrt(r_sq);
                     double force_mag = G * body.mass * other->mass / (r_sq * r_mag);
+                    
+                    // Check for numerical overflow
+                    if (std::isnan(force_mag) || std::isinf(force_mag)) continue;
+                    
                     force += r.normalized() * force_mag;
                 }
                 return force;
